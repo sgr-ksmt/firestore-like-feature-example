@@ -1,0 +1,180 @@
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userID} {
+      allow read: if isAuthenticated();
+      allow create:
+        if isUserAuthenticated(userID)
+        && validateName()
+        && incomingData().likePostCount == 0
+        && incomingData().createTime == request.time
+        && incomingData().updateTime == request.time;
+      allow update:
+        if (isUpdatingMyData() || isUpdatingOnlyLikeCount());
+
+      function isUpdatingMyData() {
+        return isUserAuthenticated(userID)
+          && validateName()
+          && isNotChanged('likeCount');
+      }
+
+      function isUpdatingOnlyLikeCount() {
+        return isUserAuthenticated(userID)
+          && (
+            isIncrementedField('likePostCount', 1)
+            || isIncrementedField('likePostCount', -1)
+          )
+          && isNotChanged('name')
+      }
+
+      function validateName() {
+        return validateString(incomingData().name, 1, 16);
+      }
+
+      match /posts/{postID} {
+        allow create:
+          if isUserAuthenticated(userID)
+          && validateTitle()
+          && validateBody()
+          && incomingData().author == documentPath(['users', userID])
+          && incomingData().likeCount == 0
+          && incomingData().createTime == request.time
+          && incomingData().updateTime == request.time;
+
+        allow update:
+          if (isUpdatingByAuthor() || isUpdatingByVisitor())
+          && isNotChanged('author')
+          && isNotChanged('createTime')
+          && incomingData().updateTime == request.time;
+
+        function validateTitle() {
+          return validateString(incomingData().title, 1, 25);
+        }
+
+        function validateBody() {
+          return validateString(incomingData().body, 1, 1000);
+        }
+
+        function isUpdatingByAuthor() {
+          return isUserAuthenticated(userID)
+            && validateTitle()
+            && validateBody()
+            && isNotChanged('likeCount');
+        }
+
+        function isUpdatingByVisitor() {
+          return isAuthenticated()
+            && ((
+              isIncrementedField('likeCount', 1)
+                && (!exists(likedUserPath()) && existsAfter(likedUserPath()))
+                && (!exists(likedPostPath()) && existsAfter(likedPostPath()))
+              )
+              || (
+              isIncrementedField('likeCount', -1)
+                && (exists(likedUserPath()) && !existsAfter(likedUserPath()))
+                && (exists(likedPostPath()) && !existsAfter(likedPostPath()))
+              )
+            )
+            && isNotChanged('title')
+            && isNotChanged('body');
+        }
+
+        function likedUserPath() {
+          return documentPath(['users', userID, 'posts', postID, 'likedUsers', request.auth.uid]);
+        }
+
+        function likedPostPath() {
+          return documentPath(['users', request.auth.uid, 'likedPosts', postID]);
+        }
+
+        match /likedUsers/{likedUserID} {
+          allow create:
+            if isUserAuthenticated(likedUserID)
+            && incomingData().id == likedUserID
+            && incomingData().createTime == request.time
+            && isIncremented(getAfterData(postPath()), getData(postPath()), 'likeCount', 1)
+            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', 1)
+
+          allow delete:
+            if isUserAuthenticated(likedUserID)
+            && isIncremented(getAfterData(postPath()), getData(postPath()), 'likeCount', -1)
+            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', -1)
+
+          function postPath() {
+            return documentPath(['users', userID, 'posts', postID]);
+          }
+
+          function userPath() {
+            return documentPath(['users', likedUserID]);
+          }
+        }
+      }
+
+      match /likedPosts/{likedPostID} {
+        allow create:
+          if isUserAuthenticated(userID)
+          && incomingData().id == likedPostID
+          && incomingData().createTime == request.time
+          && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', 1)
+          && isIncremented(getAfterData(incomingData().postRef), getData(incomingData().postRef), 'likeCount', 1)
+
+        allow delete:
+          if isUserAuthenticated(userID)
+          && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', -1)
+          && isIncremented(getAfterData(existingData().postRef), getData(existingData().postRef), 'likeCount', -1)
+
+        function userPath() {
+          return documentPath(['users', userID]);
+        }
+      }
+    }
+
+    function documentPath(paths) {
+      return path([
+        ['databases', database, 'documents'].join('/'),
+        paths.join('/')
+      ].join('/'));
+    }
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUserAuthenticated(userID) {
+      return request.auth.uid == userID;
+    }
+
+    function incomingData() {
+      return request.resource.data;
+    }
+
+    function existingData() {
+      return resource.data;
+    }
+
+    function getData(path) {
+      return get(path).data;
+    }
+
+    function getAfterData(path) {
+      return getAfter(path).data;
+    }
+
+    function validateString(text, min, max) {
+      return text is string
+        && min <= text.size()
+        && text.size() <= max;
+    }
+
+    function isNotChanged(key) {
+      return incomingData()[key] == existingData()[key];
+    }
+
+    function isIncremented(before, after, key, number) {
+      return before[key] == after[key] + number;
+    }
+
+    function isIncrementedField(key, number) {
+      return isIncremented(incomingData(), existingData(), key, number);
+    }
+  }
+}

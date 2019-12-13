@@ -1,3 +1,4 @@
+rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /users/{userID} {
@@ -6,15 +7,16 @@ service cloud.firestore {
         if isUserAuthenticated(userID)
         && validateName()
         && incomingData().likePostCount == 0
-        && incomingData().createTime == request.time
-        && incomingData().updateTime == request.time;
+        && isRequestedTime(incomingData().createTime)
+        && isRequestedTime(incomingData().updateTime);
       allow update:
         if (isUpdatingMyData() || isUpdatingOnlyLikeCount());
 
       function isUpdatingMyData() {
         return isUserAuthenticated(userID)
           && validateName()
-          && isNotChanged('likeCount');
+          && isNotChanged('likeCount')
+          && isRequestedTime(incomingData());
       }
 
       function isUpdatingOnlyLikeCount() {
@@ -31,20 +33,21 @@ service cloud.firestore {
       }
 
       match /posts/{postID} {
+        allow read: if isAuthenticated();
         allow create:
           if isUserAuthenticated(userID)
           && validateTitle()
           && validateBody()
           && incomingData().author == documentPath(['users', userID])
           && incomingData().likeCount == 0
-          && incomingData().createTime == request.time
-          && incomingData().updateTime == request.time;
+          && isRequestedTime(incomingData().createTime)
+          && isRequestedTime(incomingData().updateTime);
 
         allow update:
           if (isUpdatingByAuthor() || isUpdatingByVisitor())
           && isNotChanged('author')
-          && isNotChanged('createTime')
-          && incomingData().updateTime == request.time;
+          && isNotChanged('createTime');
+
 
         function validateTitle() {
           return validateString(incomingData().title, 1, 25);
@@ -58,6 +61,7 @@ service cloud.firestore {
           return isUserAuthenticated(userID)
             && validateTitle()
             && validateBody()
+            && isRequestedTime(incomingData().updateTime)
             && isNotChanged('likeCount');
         }
 
@@ -75,7 +79,8 @@ service cloud.firestore {
               )
             )
             && isNotChanged('title')
-            && isNotChanged('body');
+            && isNotChanged('body')
+            && isNotChanged('updateTime');
         }
 
         function likedUserPath() {
@@ -87,17 +92,22 @@ service cloud.firestore {
         }
 
         match /likedUsers/{likedUserID} {
+          allow read: if isAuthenticated();
           allow create:
             if isUserAuthenticated(likedUserID)
             && incomingData().id == likedUserID
-            && incomingData().createTime == request.time
+            && isRequestedTime(incomingData().createTime)
+            && !exists(likedPostPath(postID))
+            && getAfterData(likedPostPath(postID)).id == postID
             && isIncremented(getAfterData(postPath()), getData(postPath()), 'likeCount', 1)
-            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', 1)
+            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', 1);
 
           allow delete:
             if isUserAuthenticated(likedUserID)
+            && exists(likedPostPath(postID))
+            && !existsAfter(likedPostPath(postID))
             && isIncremented(getAfterData(postPath()), getData(postPath()), 'likeCount', -1)
-            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', -1)
+            && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', -1);
 
           function postPath() {
             return documentPath(['users', userID, 'posts', postID]);
@@ -106,26 +116,51 @@ service cloud.firestore {
           function userPath() {
             return documentPath(['users', likedUserID]);
           }
+
+          function likedPostPath(postID) {
+            return documentPath(['users', likedUserID, 'likedPosts', postID]);
+          }
         }
       }
 
       match /likedPosts/{likedPostID} {
+        allow read: if isAuthenticated();
         allow create:
           if isUserAuthenticated(userID)
           && incomingData().id == likedPostID
-          && incomingData().createTime == request.time
+          && isRequestedTime(incomingData().createTime)
+          && !exists(likedUserPath(userID, incomingData()))
+          && getAfterData(likedUserPath(userID, incomingData())).id == userID
           && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', 1)
-          && isIncremented(getAfterData(incomingData().postRef), getData(incomingData().postRef), 'likeCount', 1)
+          && isIncremented(getAfterData(incomingData().postRef), getData(incomingData().postRef), 'likeCount', 1);
 
         allow delete:
           if isUserAuthenticated(userID)
+          && exists(likedUserPath(userID, existingData()))
+          && !existsAfter(likedUserPath(userID, existingData()))
           && isIncremented(getAfterData(userPath()), getData(userPath()), 'likePostCount', -1)
-          && isIncremented(getAfterData(existingData().postRef), getData(existingData().postRef), 'likeCount', -1)
+          && isIncremented(getAfterData(existingData().postRef), getData(existingData().postRef), 'likeCount', -1);
 
         function userPath() {
           return documentPath(['users', userID]);
         }
+
+        function likedUserPath(userID, data) {
+            return documentPath(['users', get(getData(data.postRef).author).id, 'posts', likedPostID, 'likedUsers', userID]);
+          }
       }
+    }
+
+    match /{path=**}/posts/{postID} {
+      allow list: if isAuthenticated();
+    }
+
+    match /{path=**}/likedPosts/{likedPostID} {
+      allow list: if isAuthenticated();
+    }
+
+    match /{path=**}/likedUsers/{likedUserID} {
+      allow list: if isAuthenticated();
     }
 
     function documentPath(paths) {
@@ -159,6 +194,10 @@ service cloud.firestore {
       return getAfter(path).data;
     }
 
+    function isRequestedTime(time) {
+      return time == request.time;
+    }
+
     function validateString(text, min, max) {
       return text is string
         && min <= text.size()
@@ -169,8 +208,8 @@ service cloud.firestore {
       return incomingData()[key] == existingData()[key];
     }
 
-    function isIncremented(before, after, key, number) {
-      return before[key] == after[key] + number;
+    function isIncremented(after, before, key, number) {
+      return after[key] == before[key] + number;
     }
 
     function isIncrementedField(key, number) {
